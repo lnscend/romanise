@@ -9,7 +9,7 @@ from romanise_pdf import convert_pdf
 st.set_page_config(page_title="Songbook Romaniser", page_icon="🎵")
 st.title("Songbook Romaniser")
 st.write("Upload a songbook, then download a PDF with red Roman-numeral chords.")
-st.caption("For selectable-text PDFs in the supplied songbook format. Minor keys use their relative major.")
+st.caption("For selectable-text chord PDFs. Printed keys are preferred; otherwise the key is inferred. Minor keys use their relative major.")
 upload = st.file_uploader("Songbook PDF", type=["pdf"])
 auto = st.checkbox("Detect unmarked key changes", value=True)
 with st.expander("Optional corrections"):
@@ -65,6 +65,9 @@ if upload is not None:
                         st.error("Could not regenerate: " + str(error))
         stem = Path(upload.name).stem + "-roman"
         pages = report["pages"]
+        with st.expander("Keys used"):
+            for page in pages:
+                st.write(f"Page {page['page']}: {page.get('initial_key', 'unknown')} — {page.get('key_source', 'not converted')}")
         st.success(f'{sum(p["status"] == "converted" for p in pages)} of {len(pages)} pages converted; {sum(p.get("chords", 0) for p in pages)} chords.')
         st.download_button("Download Roman-numeral PDF", output, stem + ".pdf", "application/pdf")
         st.download_button("Download chord audit / corrections", json.dumps(report, indent=2), stem + ".audit.json", "application/json")
