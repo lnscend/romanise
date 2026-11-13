@@ -105,14 +105,40 @@ def extract_page(page, override):
     header = ' '.join(''.join(c['c'] for c in s['chars']) for s in headers)
     match = re.search(r'\[\s*([A-G][#b]?m?)(?:\s*[-–→]\s*([A-G][#b]?m?))?(?=\s*[,\]])', norm(header))
     initial = override.get('initial_key') or (match[1] if match else None)
+    key_bottom = 0
     if not initial:
-        raise ValueError('No bracketed key found in the page heading. Add an initial_key override.')
-    tonic(initial)
-    cutoff = max([s['bbox'][3] for s in headers] or [50]) + 4
-    body = [s for s in spans if s['origin'][1] > cutoff and 9 <= s['size'] <= 14]
+        for s in spans:
+            label = norm(''.join(c['c'] for c in s['chars']))
+            m = re.match(r'^Key\s*[-:=–]?\s*([A-G][#b]?m?)(?=\s|[|,]|$)',label,re.I)
+            if m and s['bbox'][1] < page.rect.height*.2:
+                initial = m[1][0].upper()+m[1][1:].lower()
+                key_bottom = s['bbox'][3]
+                break
+    if initial: tonic(initial)
+    cutoff = max([s['bbox'][3] for s in headers] + [key_bottom, 0]) + 4
+    # Superscript chord extensions are separate spans in SongSelect PDFs.
+    consumed = set()
+    for idx,s in enumerate(spans):
+        text = norm(''.join(c['c'] for c in s['chars']))
+        if not re.fullmatch(r'[#b]?\d+',text): continue
+        for base in spans:
+            core = norm(''.join(c['c'] for c in base['chars']))
+            if (is_chord(core) and not core.startswith('/') and base['font']==s['font']
+                and .5 < base['origin'][1]-s['origin'][1] < 6
+                and -1.5 < s['bbox'][0]-base['bbox'][2] < 2
+                and s['size'] <= base['size'] and is_chord(core+text)):
+                base['chars'].extend(s['chars'])
+                base['bbox'] = tuple(fitz.Rect(base['bbox']) | fitz.Rect(s['bbox']))
+                consumed.add(idx)
+                break
+    footer = min([s['bbox'][1] for s in spans if s['bbox'][1] > page.rect.height*.65 and
+                  re.search(r'©|CCLI\s+(?:Song|License)', ''.join(c['c'] for c in s['chars']), re.I)]
+                 or [page.rect.height*.96])
+    body = [s for i,s in enumerate(spans) if i not in consumed and
+            cutoff < s['origin'][1] < footer and 7 <= s['size'] <= 14]
     # The supplied format uses a fixed right-column start near 52.5% of the page.
     starts = sum(1 for s in body if s['color'] != 0xffffff and
-                 abs(s['bbox'][0] - page.rect.width*.525) < 2)
+                 page.rect.width*.50 < s['bbox'][0] < page.rect.width*.55)
     two_columns = starts >= 6
     midpoint = page.rect.width/2
     rows = {}
@@ -149,17 +175,52 @@ def extract_page(page, override):
                         break
     for row in ordered:
         row.tokens.sort(key=lambda t:t.x)
+        # Some PDFs simulate bold by painting the same text twice.
+        unique = []
+        for t in row.tokens:
+            duplicate = next((u for u in unique if u.text==t.text and abs(u.x-t.x)<.6),None)
+            if duplicate:
+                duplicate.rects.extend(t.rects)
+            else: unique.append(t)
+        row.tokens = unique
         text = ' '.join(t.text for t in row.tokens)
         marker = MARKER.fullmatch(text)
         if marker:
             row.marker = marker[1][0].upper()+marker[1][1:].lower()
-        for t in row.tokens: t.chord = t.bold and is_chord(t.text)
+        for t in row.tokens: t.chord = is_chord(t.text)
         def allowed(t):
             # Standalone x means a mute/stop, not an unrecognised lyric word.
             return t.chord or bool(re.fullmatch(r'[|/.:()\[\]\-]+|[xX×](?:\d+)?|N\.?C\.?|Intro:?', t.text)) or bool(
                 re.fullmatch(r'\((?:choke|stop|hold|mute|ring|rest)\)', t.text, re.I))
-        row.chord_row = any(t.chord for t in row.tokens) and all(allowed(t) for t in row.tokens)
+        directions = ' '.join(t.text for t in row.tokens if not allowed(t))
+        row.chord_row = any(t.chord for t in row.tokens) and (
+            all(allowed(t) for t in row.tokens) or (sum(t.chord for t in row.tokens)==1 and bool(re.fullmatch(r'\([^()]*\)', directions))))
     return initial, header, ordered, two_columns, repairs
+
+def infer_key(rows):
+    chords = []
+    for row in rows:
+        if row.marker and chords: break
+        if row.chord_row:
+            chords.extend(t.text for t in row.tokens if t.chord and not chord_core(t.text).startswith('/'))
+        if len(chords)>=12: break
+    chords = chords[:12]
+    if not chords: raise ValueError('No readable chords found to infer a key.')
+    scored=[]
+    for candidate in range(12):
+        matches=sum(fits(c,candidate) for c in chords)
+        cadences=sum(analyse(a)==((candidate+7)%12,'M') and analyse(b)==(candidate,'M') or
+                     analyse(a)==((candidate+4)%12,'M') and analyse(b)==((candidate+9)%12,'m')
+                     for a,b in zip(chords,chords[1:]))
+        home=analyse(chords[0]) in [(candidate,'M'),((candidate+9)%12,'m')]
+        scored.append((matches*4+min(cadences,2)*3+int(home),matches,candidate))
+    scored.sort(reverse=True)
+    best,second=scored[:2]
+    if (len(chords)>=8 and len({analyse(c) for c in chords})>=3 and
+        best[1]>=len(chords)*.75 and best[0]-second[0]>=3):
+        return NAMES[best[2]],'inferred from chords'
+    root,quality=analyse(chords[0])
+    return NAMES[(root+(3 if quality=='m' else 0))%12],'first-chord fallback (review)'
 
 def detect(chords, index, current, forced):
     if fits(chords[index].text,current): return current
@@ -243,7 +304,7 @@ def convert_pdf(data, overrides=None, auto=True, colour=RED):
     overrides=overrides or {}
     fitz.TOOLS.set_small_glyph_heights(True)
     doc=fitz.open(stream=data,filetype='pdf')
-    report={'pages':[], 'warnings':[], 'converter':'songbook-romaniser 1.2'}
+    report={'pages':[], 'warnings':[], 'converter':'songbook-romaniser 1.3'}
     for page in doc:
         pn=page.number+1
         config=overrides.get('pages',{}).get(str(pn),{})
@@ -264,6 +325,11 @@ def convert_pdf(data, overrides=None, auto=True, colour=RED):
                         text=' '.join(t.text for t in row.tokens),
                         excluded=row_id(row) in excluded))
             render = lambda r: r.chord_row and row_id(r) not in excluded
+            key_source = 'manual override' if config.get('initial_key') else 'printed key'
+            if not initial:
+                initial,key_source = infer_key(rows)
+                info['warnings'].append(f'No printed key: using {initial} ({key_source}).')
+            info['key_source'] = key_source
             chords,events=assign_keys(rows,initial,config,auto)
             if not chords: raise ValueError('No confidently identified bold chord rows.')
             placements=[]
@@ -282,9 +348,16 @@ def convert_pdf(data, overrides=None, auto=True, colour=RED):
                 if not render(row): continue
                 for s in row.spans:
                     rect=fitz.Rect(s['bbox']); rect.x0+=.05; rect.x1-=.05; rect.y0+=.05; rect.y1-=.05
+                    # A narrow band intersects the target glyphs without touching
+                    # neighbouring lyric lines whose font bounds may overlap.
+                    middle=(rect.y0+rect.y1)/2
+                    rect.y0=middle-.5; rect.y1=middle+.5
                     if not rect.is_empty: page.add_redact_annot(rect,fill=False,cross_out=False)
                 for t in row.tokens:
-                    for rect in t.rects[1:]: page.add_redact_annot(rect,fill=False,cross_out=False)
+                    for original in t.rects[1:]:
+                        rect=fitz.Rect(original); middle=(rect.y0+rect.y1)/2
+                        rect.y0=middle-.5; rect.y1=middle+.5
+                        page.add_redact_annot(rect,fill=False,cross_out=False)
             page.apply_redactions(images=0,graphics=0,text=0)
             moved=0
             applied = {t.number for r in rows if render(r) for t in r.tokens if t.chord}
@@ -331,5 +404,6 @@ def main():
     print('PDF:',output,'\nAudit:',audit)
 
 if __name__=='__main__': main()
+
 
 # python -m streamlit run app.py
